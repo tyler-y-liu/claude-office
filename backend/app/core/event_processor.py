@@ -10,6 +10,7 @@ Public surface (unchanged from before the refactor):
 
 import asyncio
 import contextlib
+import itertools
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -194,6 +195,13 @@ class EventProcessor:
         # (see ``_process_event_internal``). Cleared whenever the DB is wiped
         # so wiped sessions are re-checked on their next event.
         self._recovery_checked: set[str] = set()
+        # Monotonic suffix for history / conversation entry ids. Producer
+        # timestamps are not unique — hooks that only carry second precision,
+        # or a producer replaying a burst of events, emit many events with the
+        # same timestamp. The frontend uses these ids as React keys, so a
+        # collision shows up as "Encountered two children with the same key"
+        # (and entries getting dropped or duplicated on re-render).
+        self._entry_seq = itertools.count(1)
         # Coalesces Command Center overview broadcasts: bursts of events schedule
         # a single deferred flush instead of rebuilding the full peer-merge once
         # per event (O(N x events/sec)). See ``_schedule_overview_broadcast``.
@@ -593,7 +601,7 @@ class EventProcessor:
                 detail[dst] = val
 
         event_dict: HistoryEntry = {
-            "id": str(event.timestamp.timestamp()),
+            "id": self._entry_id(event),
             "type": str(event.event_type),
             "agentId": agent_id,
             "summary": self._get_event_summary(event),
@@ -817,7 +825,7 @@ class EventProcessor:
 
                     agent_id = evt.data.agent_id or "main"
                     history_entry: HistoryEntry = {
-                        "id": str(evt.timestamp.timestamp()),
+                        "id": f"{evt.timestamp.timestamp()}-{rec.id}",
                         "type": str(evt.event_type),
                         "agentId": agent_id,
                         "summary": self._get_event_summary(evt),
@@ -833,7 +841,7 @@ class EventProcessor:
                         assert isinstance(evt, PromptEvent)
                         if evt.data.prompt and "<task-notification>" not in evt.data.prompt:
                             conv_entry: ConversationEntry = {
-                                "id": str(evt.timestamp.timestamp()),
+                                "id": f"{evt.timestamp.timestamp()}-{rec.id}",
                                 "role": "user",
                                 "agentId": agent_id,
                                 "text": evt.data.prompt,
@@ -844,7 +852,7 @@ class EventProcessor:
                         assert isinstance(evt, ToolEvent)
                         if evt.data.thinking:
                             thinking_entry: ConversationEntry = {
-                                "id": f"{evt.timestamp.timestamp()}_thinking",
+                                "id": f"{evt.timestamp.timestamp()}-{rec.id}_thinking",
                                 "role": "thinking",
                                 "agentId": agent_id,
                                 "text": evt.data.thinking,
@@ -853,7 +861,7 @@ class EventProcessor:
                             sm.append_capped(thinking_entry)
                         if evt.data.tool_name:
                             tool_entry: ConversationEntry = {
-                                "id": f"{evt.timestamp.timestamp()}_tool",
+                                "id": f"{evt.timestamp.timestamp()}-{rec.id}_tool",
                                 "role": "tool",
                                 "agentId": agent_id,
                                 "text": self._get_event_summary(evt),
@@ -871,7 +879,7 @@ class EventProcessor:
                             )
                             if response:
                                 assistant_entry: ConversationEntry = {
-                                    "id": str(evt.timestamp.timestamp()),
+                                    "id": f"{evt.timestamp.timestamp()}-{rec.id}",
                                     "role": "assistant",
                                     "agentId": agent_id,
                                     "text": response,
@@ -1155,6 +1163,24 @@ class EventProcessor:
             A one-line human-readable summary string.
         """
         return self._get_event_summary(event)
+
+    def _entry_id(self, event: AnyEvent, suffix: str = "") -> str:
+        """Build a unique id for a history / conversation entry.
+
+        The timestamp alone is not a key: producers are free to send several
+        events with the same ``timestamp`` (second-precision hooks, or a
+        non-Claude producer replaying events). Pairing the timestamp with a
+        per-process counter keeps ids unique while still sortable and
+        human-readable.
+
+        Args:
+            event: The event the entry describes.
+            suffix: Optional role suffix (``_tool``, ``_thinking``).
+
+        Returns:
+            A string unique to this entry within the process.
+        """
+        return f"{event.timestamp.timestamp()}-{next(self._entry_seq)}{suffix}"
 
     def _get_event_summary(self, event: AnyEvent) -> str:
         """Generate a human-readable one-line summary for the event log.
