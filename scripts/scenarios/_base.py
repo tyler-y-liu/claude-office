@@ -14,6 +14,11 @@ import requests
 
 API_URL = os.environ.get("CLAUDE_OFFICE_API_URL", "http://localhost:8000/api/v1/events")
 
+# When the backend is started with an explicit ``CLAUDE_OFFICE_API_KEY``, every
+# non-public path (including ``POST /api/v1/events``) requires the key in the
+# ``X-API-Key`` header. Without this the whole scenario fails with 401.
+API_KEY = os.environ.get("CLAUDE_OFFICE_API_KEY", "").strip()
+
 # Context window constants
 MAX_CONTEXT_TOKENS = 200_000
 COMPACTION_THRESHOLD = 0.80  # Trigger compaction at 80%
@@ -69,6 +74,11 @@ class SimulationContext:
 
     session_id: str = "sim_session_123"
     verbose: bool = True
+    api_key: str = ""
+    # Number of events the backend rejected (HTTP error, timeout, ...). The
+    # entry point turns this into a non-zero exit code so scripted runs cannot
+    # mistake a fully-failed scenario for a successful one.
+    failures: int = 0
 
     # Token counters (protected by ``lock``)
     input_tokens: int = 0
@@ -111,10 +121,12 @@ class SimulationContext:
             "timestamp": datetime.now(UTC).isoformat(),
             "data": data or {},
         }
+        headers = {"X-API-Key": self.api_key or API_KEY} if (self.api_key or API_KEY) else {}
         try:
-            response = requests.post(API_URL, json=payload, timeout=10)
+            response = requests.post(API_URL, json=payload, headers=headers, timeout=10)
             response.raise_for_status()
         except Exception as e:
+            self.failures += 1
             self.log(f"Error sending {event_type}: {e}")
 
     def increment_context(self, input_delta: int = 0, output_delta: int = 0) -> dict[str, int]:

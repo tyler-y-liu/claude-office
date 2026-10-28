@@ -26,6 +26,7 @@ Usage::
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -64,6 +65,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Suppress progress output",
     )
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("CLAUDE_OFFICE_API_KEY", ""),
+        metavar="KEY",
+        help=(
+            "API key for the backend. Required when the backend was started with an "
+            "explicit CLAUDE_OFFICE_API_KEY (every endpoint then requires it). "
+            "Defaults to $CLAUDE_OFFICE_API_KEY."
+        ),
+    )
     return parser
 
 
@@ -75,10 +86,19 @@ def main() -> None:
     ctx = SimulationContext(
         session_id=args.session,
         verbose=not args.quiet,
+        api_key=args.api_key,
     )
 
     print(f"Running scenario '{args.scenario}' with session '{args.session}'...")
     SCENARIOS[args.scenario](ctx)
+
+    if ctx.failures:
+        print(
+            f"Done with {ctx.failures} failed event(s) — the backend rejected them "
+            f"(check CLAUDE_OFFICE_API_KEY, or that the backend is running).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     print("Done.")
 
 
