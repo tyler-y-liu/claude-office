@@ -123,7 +123,19 @@ class SimulationContext:
         }
         headers = {"X-API-Key": self.api_key or API_KEY} if (self.api_key or API_KEY) else {}
         try:
-            response = requests.post(API_URL, json=payload, headers=headers, timeout=10)
+            # Redirects stay disabled on purpose: ``requests`` re-sends custom
+            # headers (including ``X-API-Key``) to the redirect target, so an
+            # unexpected ``CLAUDE_OFFICE_API_URL`` could hand the key to another
+            # host. A 3xx therefore counts as a failed event, not as success.
+            response = requests.post(
+                API_URL, json=payload, headers=headers, timeout=10, allow_redirects=False
+            )
+            if 300 <= response.status_code < 400:
+                raise requests.HTTPError(
+                    f"refused redirect ({response.status_code}) - following it would "
+                    "send X-API-Key to another host; check CLAUDE_OFFICE_API_URL",
+                    response=response,
+                )
             response.raise_for_status()
         except Exception as e:
             self.failures += 1
