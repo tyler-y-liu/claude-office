@@ -72,7 +72,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "API key for the backend. Required when the backend was started with an "
             "explicit CLAUDE_OFFICE_API_KEY (every endpoint then requires it). "
-            "Defaults to $CLAUDE_OFFICE_API_KEY."
+            "Defaults to $CLAUDE_OFFICE_API_KEY, which is the safer option: a key "
+            "passed on the command line also shows up in process listings and shell "
+            "history."
         ),
     )
     return parser

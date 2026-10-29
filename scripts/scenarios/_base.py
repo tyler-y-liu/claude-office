@@ -218,19 +218,35 @@ class TeamSimulationContext:
         team_name: Identifier shared by every member's ``team_name`` field.
         project_name: Shared ``project_name`` sent on ``session_start``.
         verbose: Forwarded to each member ``SimulationContext``.
+        api_key: Forwarded to each member ``SimulationContext``; without it
+                 every member event would be rejected by a key-protected
+                 backend even when the CLI key is set.
         members: Member contexts in creation order (lead first).
     """
 
     team_name: str
     project_name: str = "TeamProject"
     verbose: bool = True
+    api_key: str = ""
     members: list[SimulationContext] = field(default_factory=list)
 
     def _add(self, session_id: str) -> SimulationContext:
         """Create a member context, register it, and return it."""
-        ctx = SimulationContext(session_id=session_id, verbose=self.verbose)
+        ctx = SimulationContext(
+            session_id=session_id, verbose=self.verbose, api_key=self.api_key
+        )
         self.members.append(ctx)
         return ctx
+
+    @property
+    def total_failures(self) -> int:
+        """Number of rejected events summed over every member context.
+
+        Each member sends events through its own ``SimulationContext``, so the
+        scenario's parent context never sees their failures; the scenario adds
+        this total back to the parent before the entry point inspects it.
+        """
+        return sum(member.failures for member in self.members)
 
     def add_lead(self, session_id: str) -> SimulationContext:
         """Create and register the lead session context."""
