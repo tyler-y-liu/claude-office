@@ -10,7 +10,6 @@ Public surface (unchanged from before the refactor):
 
 import asyncio
 import contextlib
-import itertools
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -195,13 +194,6 @@ class EventProcessor:
         # (see ``_process_event_internal``). Cleared whenever the DB is wiped
         # so wiped sessions are re-checked on their next event.
         self._recovery_checked: set[str] = set()
-        # Monotonic suffix for history / conversation entry ids. Producer
-        # timestamps are not unique — hooks that only carry second precision,
-        # or a producer replaying a burst of events, emit many events with the
-        # same timestamp. The frontend uses these ids as React keys, so a
-        # collision shows up as "Encountered two children with the same key"
-        # (and entries getting dropped or duplicated on re-render).
-        self._entry_seq = itertools.count(1)
         # Coalesces Command Center overview broadcasts: bursts of events schedule
         # a single deferred flush instead of rebuilding the full peer-merge once
         # per event (O(N x events/sec)). See ``_schedule_overview_broadcast``.
@@ -226,7 +218,7 @@ class EventProcessor:
         # only one entry fires per event (events have a single type), so the
         # relative order of entries here is not behaviourally significant.
         self._post_broadcast_enrichers: dict[
-            EventType, Callable[[StateMachine, AnyEvent, str], Awaitable[None]]
+            EventType, Callable[[StateMachine, AnyEvent, str, str], Awaitable[None]]
         ] = {
             EventType.SUBAGENT_START: self._enrich_subagent_start,
             EventType.SUBAGENT_INFO: self._enrich_subagent_info,
@@ -421,15 +413,20 @@ class EventProcessor:
     # Post-broadcast async enrichment (one method per event type)
     #
     # Each ``_enrich_*`` method is a thin adapter with the uniform signature
-    # ``(sm, event, agent_id) -> None`` so the dispatch table can call it
-    # without per-type branching. The body is exactly the handler call the
+    # ``(sm, event, agent_id, entry_id) -> None`` so the dispatch table can call
+    # it without per-type branching. The body is exactly the handler call the
     # corresponding ``if event.event_type == ...`` block used to make -- no
     # behaviour change, just table-driven routing. See
     # ``self._post_broadcast_enrichers`` for the single source of truth.
+    #
+    # ``entry_id`` is the unique id built for this event's history entry (see
+    # ``_entry_id``). Handlers that also append conversation entries derive
+    # their ids from it, so a conversation entry and its history entry never
+    # disagree, and two events sharing a timestamp never collide.
     # ------------------------------------------------------------------
 
     async def _enrich_subagent_start(
-        self, sm: StateMachine, event: AnyEvent, agent_id: str
+        self, sm: StateMachine, event: AnyEvent, agent_id: str, _entry_id: str
     ) -> None:
         assert isinstance(event, AgentEvent), "dispatch routes SUBAGENT_START only"
         await handle_subagent_start(
@@ -439,43 +436,57 @@ class EventProcessor:
             self._update_agent_state,
         )
 
-    async def _enrich_subagent_info(self, sm: StateMachine, event: AnyEvent, agent_id: str) -> None:
+    async def _enrich_subagent_info(
+        self, sm: StateMachine, event: AnyEvent, agent_id: str, _entry_id: str
+    ) -> None:
         assert isinstance(event, AgentEvent), "dispatch routes SUBAGENT_INFO only"
         await handle_subagent_info(sm, event, self._ensure_transcript_poller)
 
-    async def _enrich_agent_update(self, sm: StateMachine, event: AnyEvent, agent_id: str) -> None:
+    async def _enrich_agent_update(
+        self, sm: StateMachine, event: AnyEvent, agent_id: str, _entry_id: str
+    ) -> None:
         assert isinstance(event, AgentEvent), "dispatch routes AGENT_UPDATE only"
         await handle_agent_update(sm, event)
 
-    async def _enrich_subagent_stop(self, sm: StateMachine, event: AnyEvent, agent_id: str) -> None:
+    async def _enrich_subagent_stop(
+        self, sm: StateMachine, event: AnyEvent, agent_id: str, _entry_id: str
+    ) -> None:
         assert isinstance(event, AgentEvent), "dispatch routes SUBAGENT_STOP only"
         await handle_subagent_stop(sm, event, self._persist_synthetic_event)
 
-    async def _enrich_stop(self, sm: StateMachine, event: AnyEvent, agent_id: str) -> None:
+    async def _enrich_stop(
+        self, sm: StateMachine, event: AnyEvent, agent_id: str, entry_id: str
+    ) -> None:
         assert isinstance(event, LifecycleEvent), "dispatch routes STOP only"
-        await handle_stop(sm, event, agent_id)
+        await handle_stop(sm, event, agent_id, entry_id)
 
     async def _enrich_user_prompt_submit(
-        self, sm: StateMachine, event: AnyEvent, agent_id: str
+        self, sm: StateMachine, event: AnyEvent, agent_id: str, entry_id: str
     ) -> None:
         assert isinstance(event, PromptEvent), "dispatch routes USER_PROMPT_SUBMIT only"
-        await handle_user_prompt_submit(sm, event, agent_id)
+        await handle_user_prompt_submit(sm, event, agent_id, entry_id)
 
-    async def _enrich_pre_tool_use(self, sm: StateMachine, event: AnyEvent, agent_id: str) -> None:
+    async def _enrich_pre_tool_use(
+        self, sm: StateMachine, event: AnyEvent, agent_id: str, entry_id: str
+    ) -> None:
         assert isinstance(event, ToolEvent), "dispatch routes PRE_TOOL_USE only"
-        await handle_pre_tool_use(sm, event, agent_id, self._get_event_summary(event))
+        await handle_pre_tool_use(sm, event, agent_id, self._get_event_summary(event), entry_id)
 
-    async def _enrich_task_created(self, sm: StateMachine, event: AnyEvent, agent_id: str) -> None:
+    async def _enrich_task_created(
+        self, sm: StateMachine, event: AnyEvent, agent_id: str, _entry_id: str
+    ) -> None:
         assert isinstance(event, TaskEvent), "dispatch routes TASK_CREATED only"
         await handle_task_created(sm, event)
 
     async def _enrich_task_completed(
-        self, sm: StateMachine, event: AnyEvent, agent_id: str
+        self, sm: StateMachine, event: AnyEvent, agent_id: str, _entry_id: str
     ) -> None:
         assert isinstance(event, TaskEvent), "dispatch routes TASK_COMPLETED only"
         await handle_task_completed(sm, event)
 
-    async def _enrich_teammate_idle(self, sm: StateMachine, event: AnyEvent, agent_id: str) -> None:
+    async def _enrich_teammate_idle(
+        self, sm: StateMachine, event: AnyEvent, agent_id: str, _entry_id: str
+    ) -> None:
         assert isinstance(event, LifecycleEvent), "dispatch routes TEAMMATE_IDLE only"
         await handle_teammate_idle(sm, event)
 
@@ -535,16 +546,24 @@ class EventProcessor:
                 resolved_floor_id = assignment.floor_id
                 resolved_room_id = assignment.room_id
 
-        await self._persist_event(event, resolved_floor_id, resolved_room_id)
+        event_row_id = await self._persist_event(event, resolved_floor_id, resolved_room_id)
 
         # Replay from DB *before* acquiring the lock: the restore is async I/O
         # that can take hundreds of ms for a long session, and holding the lock
         # across it stalls the debounced overview broadcast and /ws/overview
         # connects. Only the dict insertion below needs the lock.
+        #
+        # ``event_row_id`` is excluded from the replay: the row was committed a
+        # moment ago for *this* event, and the live path below applies it (state
+        # transition, history entry, conversation entries) exactly once. Without
+        # the exclusion every first event of an uncached session was applied
+        # twice — a duplicated history entry and a doubled ``sm.transition``.
         sm_preexisting = event.session_id in self.sessions
         restored: StateMachine | None = None
         if event.session_id not in self.sessions:
-            restored = await self._build_restored_state_machine(event.session_id)
+            restored = await self._build_restored_state_machine(
+                event.session_id, exclude_row_id=event_row_id
+            )
 
         async with self._sessions_lock:
             if event.session_id not in self.sessions:
@@ -601,7 +620,7 @@ class EventProcessor:
                 detail[dst] = val
 
         event_dict: HistoryEntry = {
-            "id": self._entry_id(event),
+            "id": self._entry_id(event, event_row_id),
             "type": str(event.event_type),
             "agentId": agent_id,
             "summary": self._get_event_summary(event),
@@ -677,7 +696,7 @@ class EventProcessor:
         # ------------------------------------------------------------------
         enricher = self._post_broadcast_enrichers.get(event.event_type)
         if enricher is not None:
-            await enricher(sm, event, agent_id)
+            await enricher(sm, event, agent_id, event_dict["id"])
 
         # ------------------------------------------------------------------
         # Cross-session overview broadcast (Command Center). Scheduled LAST so
@@ -775,7 +794,9 @@ class EventProcessor:
             db.add(event_rec)
             await db.commit()
 
-    async def _build_restored_state_machine(self, session_id: str) -> StateMachine | None:
+    async def _build_restored_state_machine(
+        self, session_id: str, exclude_row_id: int | None = None
+    ) -> StateMachine | None:
         """Reconstruct a StateMachine from persisted DB events.
 
         Replays all events for the session through a fresh StateMachine,
@@ -786,6 +807,10 @@ class EventProcessor:
 
         Args:
             session_id: The session to restore.
+            exclude_row_id: Event row id to leave out of the replay. The live
+                pipeline passes the row it just committed for the event being
+                processed, so that event is applied once (by the live path)
+                instead of twice.
         """
         async with AsyncSessionLocal() as db:
             result = await db.execute(
@@ -794,6 +819,9 @@ class EventProcessor:
                 .order_by(EventRecord.timestamp.asc())
             )
             events = result.scalars().all()
+
+            if exclude_row_id is not None:
+                events = [rec for rec in events if rec.id != exclude_row_id]
 
             if not events:
                 return None
@@ -824,8 +852,11 @@ class EventProcessor:
                     sm.transition(evt)
 
                     agent_id = evt.data.agent_id or "main"
+                    # Same id scheme as the live path, so a re-render after a
+                    # restore keeps the same React keys.
+                    entry_id = self._entry_id(evt, rec.id)
                     history_entry: HistoryEntry = {
-                        "id": f"{evt.timestamp.timestamp()}-{rec.id}",
+                        "id": entry_id,
                         "type": str(evt.event_type),
                         "agentId": agent_id,
                         "summary": self._get_event_summary(evt),
@@ -841,7 +872,7 @@ class EventProcessor:
                         assert isinstance(evt, PromptEvent)
                         if evt.data.prompt and "<task-notification>" not in evt.data.prompt:
                             conv_entry: ConversationEntry = {
-                                "id": f"{evt.timestamp.timestamp()}-{rec.id}",
+                                "id": entry_id,
                                 "role": "user",
                                 "agentId": agent_id,
                                 "text": evt.data.prompt,
@@ -852,7 +883,7 @@ class EventProcessor:
                         assert isinstance(evt, ToolEvent)
                         if evt.data.thinking:
                             thinking_entry: ConversationEntry = {
-                                "id": f"{evt.timestamp.timestamp()}-{rec.id}_thinking",
+                                "id": self._entry_id(evt, rec.id, suffix="_thinking"),
                                 "role": "thinking",
                                 "agentId": agent_id,
                                 "text": evt.data.thinking,
@@ -861,7 +892,7 @@ class EventProcessor:
                             sm.append_capped(thinking_entry)
                         if evt.data.tool_name:
                             tool_entry: ConversationEntry = {
-                                "id": f"{evt.timestamp.timestamp()}-{rec.id}_tool",
+                                "id": self._entry_id(evt, rec.id, suffix="_tool"),
                                 "role": "tool",
                                 "agentId": agent_id,
                                 "text": self._get_event_summary(evt),
@@ -879,7 +910,7 @@ class EventProcessor:
                             )
                             if response:
                                 assistant_entry: ConversationEntry = {
-                                    "id": f"{evt.timestamp.timestamp()}-{rec.id}",
+                                    "id": entry_id,
                                     "role": "assistant",
                                     "agentId": agent_id,
                                     "text": response,
@@ -938,13 +969,18 @@ class EventProcessor:
         event: AnyEvent,
         floor_id: str | None = None,
         room_id: str | None = None,
-    ) -> None:
+    ) -> int:
         """Save event to database and manage session records.
 
         Uses ``INSERT ... ON CONFLICT DO UPDATE`` for atomic upsert that
         avoids UNIQUE constraint race conditions when multiple events arrive
         concurrently for the same session, or when the session record has
         been deleted by a concurrent clear-DB operation.
+
+        Returns:
+            The primary key of the persisted ``EventRecord`` row. It is unique
+            per event and is what makes history / conversation entry ids
+            unique even when producer timestamps collide.
         """
         async with AsyncSessionLocal() as db:
             project_name = event.data.project_name
@@ -1049,7 +1085,12 @@ class EventProcessor:
                 data=event.data.model_dump(),
             )
             db.add(event_rec)
+            # Flush (not just commit) so the autoincrement primary key is
+            # populated while the object is still live; commit expires it.
+            await db.flush()
+            event_row_id = event_rec.id
             await db.commit()
+            return event_row_id
 
     async def _session_has_start_record(self, session_id: str) -> bool:
         """Return True if the session has a session_start EventRecord."""
@@ -1164,23 +1205,32 @@ class EventProcessor:
         """
         return self._get_event_summary(event)
 
-    def _entry_id(self, event: AnyEvent, suffix: str = "") -> str:
+    def _entry_id(self, event: AnyEvent, row_id: int, suffix: str = "") -> str:
         """Build a unique id for a history / conversation entry.
 
         The timestamp alone is not a key: producers are free to send several
         events with the same ``timestamp`` (second-precision hooks, or a
-        non-Claude producer replaying events). Pairing the timestamp with a
-        per-process counter keeps ids unique while still sortable and
-        human-readable.
+        non-Claude producer replaying a burst of events onto
+        ``/api/v1/events``). The frontend renders both the history and the
+        conversation list with ``key={entry.id}``, so a collision shows up as
+        "Encountered two children with the same key" and entries get dropped or
+        duplicated on re-render.
+
+        Pairing the timestamp with the persisted ``EventRecord`` primary key
+        keeps ids unique while still sortable and human-readable. Live and
+        restore paths both build ids here from the same row id, so there is one
+        id scheme instead of two that can collide, and the tool / thinking
+        entries derive their ids from the event id plus a suffix.
 
         Args:
             event: The event the entry describes.
+            row_id: Primary key of the event's persisted ``EventRecord`` row.
             suffix: Optional role suffix (``_tool``, ``_thinking``).
 
         Returns:
-            A string unique to this entry within the process.
+            A string unique to this entry.
         """
-        return f"{event.timestamp.timestamp()}-{next(self._entry_seq)}{suffix}"
+        return f"{event.timestamp.timestamp()}-{row_id}{suffix}"
 
     def _get_event_summary(self, event: AnyEvent) -> str:
         """Generate a human-readable one-line summary for the event log.
